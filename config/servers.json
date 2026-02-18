@@ -1,0 +1,22 @@
+{
+  "servers": [
+    {
+      "name": "PBX Principal",
+      "host": "pbx.example.com",
+      "port": 5060,
+      "transport": "udp",
+      "realm": "example.com",
+      "username": "1000",
+      "password": "secret123"
+    },
+    {
+      "name": "Provedor SIP",
+      "host": "sip.provider.com",
+      "port": 5060,
+      "transport": "udp",
+      "realm": "provider.com",
+      "username": "user@provider.com",
+      "password": "providerpass"
+    }
+  ]
+}

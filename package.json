@@ -1,0 +1,20 @@
+{
+  "name": "sip-kit",
+  "version": "1.0.0",
+  "description": "SIP proxy server with synthetic ICE activation for media relay",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "ts-node src/index.ts"
+  },
+  "dependencies": {
+    "sdp-transform": "^2.14.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/sdp-transform": "^2.4.9",
+    "typescript": "^5.3.3",
+    "ts-node": "^10.9.2"
+  }
+}
