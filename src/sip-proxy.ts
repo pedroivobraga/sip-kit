@@ -53,6 +53,54 @@ export class SipProxy {
     );
   }
 
+  // --- Dynamic server management ---
+
+  getServers(): SipServer[] {
+    return [...this.config.servers];
+  }
+
+  setServers(servers: SipServer[]): void {
+    this.config.servers = [...servers];
+  }
+
+  addOrUpdateServer(server: SipServer): void {
+    const idx = this.config.servers.findIndex(s => s.name === server.name);
+    if (idx >= 0) {
+      this.config.servers[idx] = server;
+    } else {
+      this.config.servers.push(server);
+    }
+  }
+
+  removeServer(name: string): boolean {
+    const idx = this.config.servers.findIndex(s => s.name === name);
+    if (idx < 0) return false;
+    this.config.servers.splice(idx, 1);
+    return true;
+  }
+
+  getActiveSessions(): object[] {
+    const sessions: object[] = [];
+    for (const [callId, dialog] of this.dialogs) {
+      sessions.push({
+        callId,
+        fromTag: dialog.fromTag,
+        toTag: dialog.toTag,
+        client: `${dialog.clientAddr}:${dialog.clientPort}`,
+        server: `${dialog.serverAddr}:${dialog.serverPort}`,
+        media: dialog.mediaSession ? {
+          clientRelay: `${dialog.mediaSession.localClientRtpPort}/${dialog.mediaSession.localClientRtcpPort}`,
+          serverRelay: `${dialog.mediaSession.localServerRtpPort}/${dialog.mediaSession.localServerRtcpPort}`,
+          clientEndpoint: `${dialog.mediaSession.clientAddr}:${dialog.mediaSession.clientPort}`,
+          serverEndpoint: `${dialog.mediaSession.serverAddr}:${dialog.mediaSession.serverPort}`,
+          iceUfrag: dialog.mediaSession.iceUfrag,
+          lastActivity: new Date(dialog.mediaSession.lastActivity).toISOString(),
+        } : null,
+      });
+    }
+    return sessions;
+  }
+
   async start(): Promise<void> {
     this.socket = dgram.createSocket('udp4');
 
