@@ -65,6 +65,7 @@ import {
   extractChallenge,
   computeDigestResponse,
   getAuthHeaderName,
+  DigestChallenge,
 } from './sip-auth';
 
 // Contact header URI regex: <sip:user@host:port;params> or <sip:host:port>
@@ -94,6 +95,8 @@ export class SipProxy {
   private registrations = new Map<string, Registration>();
   // Track active client transactions to absorb retransmissions ("callId:cseq" -> true)
   private activeClientTransactions = new Set<string>();
+  // Cache auth challenges per server for preemptive auth ("serverHost" -> challenge)
+  private cachedAuth = new Map<string, DigestChallenge>();
 
   constructor(config: ProxyConfig) {
     this.config = config;
@@ -272,10 +275,24 @@ export class SipProxy {
     }
     setHeader(msg, 'max-forwards', String(maxFwd - 1));
 
+    // Per RFC 3581: fill in rport/received on the client's top Via before adding ours
+    const existingVias = msg.headers['via'] ?? [];
+    if (existingVias.length > 0) {
+      let clientVia = existingVias[0];
+      // Fill in rport value if present without value
+      if (/;rport(?!=|\d)/.test(clientVia) || clientVia.endsWith(';rport')) {
+        clientVia = clientVia.replace(/;rport\b/, `;rport=${rinfo.port}`);
+      }
+      // Add received if source IP is not in the Via sent-by
+      if (!clientVia.includes(rinfo.address)) {
+        clientVia += `;received=${rinfo.address}`;
+      }
+      existingVias[0] = clientVia;
+    }
+
     // Add our Via header at the top
     const branch = this.generateBranch();
     const viaValue = `SIP/2.0/UDP ${this.config.externalIp}:${this.config.sipPort};branch=${branch};rport`;
-    const existingVias = msg.headers['via'] ?? [];
     msg.headers['via'] = [viaValue, ...existingVias];
 
     // Store transaction for routing responses back
@@ -284,6 +301,9 @@ export class SipProxy {
       port: rinfo.port,
       callId,
     });
+
+    // Preemptive auth: if we have a cached challenge for this server, add Authorization now
+    this.applyPreemptiveAuth(msg, target);
 
     // Store a deep copy of the original request for auth retry
     const originalCopy = this.cloneMessage(msg);
@@ -490,17 +510,20 @@ export class SipProxy {
    */
   private restoreRegisterContact(msg: SipMessage, originalContactUri: string): void {
     const contacts = msg.headers['contact'];
-    if (!contacts || contacts.length === 0) return;
+    if (!contacts || contacts.length === 0) {
+      this.log(`REGISTER 200 OK: no Contact header in response to restore`);
+      return;
+    }
 
     const proxyHost = `${this.config.externalIp}:${this.config.sipPort}`;
 
     msg.headers['contact'] = contacts.map(contact => {
       if (!contact.includes(proxyHost)) return contact;
       // Replace only the URI inside <...>, preserving server-added params (;expires=3600 etc.)
-      return contact.replace(CONTACT_URI_RE, `<${originalContactUri}>`);
+      const restored = contact.replace(CONTACT_URI_RE, `<${originalContactUri}>`);
+      this.log(`REGISTER 200 OK Contact restored: ${contact} -> ${restored}`);
+      return restored;
     });
-
-    this.log(`REGISTER 200 OK Contact restored to original client URI`);
   }
 
   // ======================================================================
@@ -673,8 +696,14 @@ export class SipProxy {
     // REGISTER 200 OK: restore original Contact and complete registration
     if (cseqMethod === 'REGISTER' && statusCode >= 200 && statusCode < 300) {
       const pendingReg = this.pendingRegisters.get(branch);
-      if (pendingReg?.originalContact) {
-        this.restoreRegisterContact(msg, pendingReg.originalContact);
+      if (pendingReg) {
+        if (pendingReg.originalContact) {
+          this.restoreRegisterContact(msg, pendingReg.originalContact);
+        } else {
+          this.log(`REGISTER 200 OK: no originalContact to restore (branch=${branch})`);
+        }
+      } else {
+        this.log(`REGISTER 200 OK: no pendingReg for branch=${branch}`);
       }
       this.completeRegistration(branch);
     }
@@ -785,6 +814,26 @@ export class SipProxy {
   // Auth challenge handling
   // ======================================================================
 
+  /**
+   * Apply cached auth credentials to an outgoing request (preemptive auth).
+   * This avoids the 401 round-trip for subsequent requests.
+   */
+  private applyPreemptiveAuth(msg: SipMessage, target: SipServer): void {
+    if (!target.username || (!target.password && !target.ha1Digest)) return;
+
+    const cached = this.cachedAuth.get(target.host);
+    if (!cached) return;
+
+    const method = msg.method!;
+    const uri = msg.requestUri!;
+    const authValue = computeDigestResponse(cached, target, method, uri);
+    if (!authValue) return;
+
+    // Use Authorization (not Proxy-Authorization) since we handle WWW-Authenticate challenges
+    msg.headers['authorization'] = [authValue];
+    this.log(`Preemptive auth applied for ${target.host}`);
+  }
+
   private async handleAuthChallenge(
     response: SipMessage,
     originalBranch: string,
@@ -815,6 +864,9 @@ export class SipProxy {
     }
 
     this.log(`Auth challenge from ${target.host}: realm="${challenge.realm}", nonce="${challenge.nonce}", qop="${challenge.qop ?? 'none'}"`);
+
+    // Cache the challenge for preemptive auth on future requests
+    this.cachedAuth.set(target.host, challenge);
 
     const retryMsg = this.cloneMessage(pending.msg);
     const method = retryMsg.method!;
