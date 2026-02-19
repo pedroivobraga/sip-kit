@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { loadConfig } from './config';
 import { SipProxy } from './sip-proxy';
 import { ManagementApi } from './api-server';
