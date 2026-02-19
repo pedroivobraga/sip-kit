@@ -92,6 +92,8 @@ export class SipProxy {
   }>();
   // Registration table: "user@serverHost" -> Registration
   private registrations = new Map<string, Registration>();
+  // Track active client transactions to absorb retransmissions ("callId:cseq" -> true)
+  private activeClientTransactions = new Set<string>();
 
   constructor(config: ProxyConfig) {
     this.config = config;
@@ -244,6 +246,15 @@ export class SipProxy {
   private async handleOutgoingRequest(msg: SipMessage, rinfo: dgram.RemoteInfo): Promise<void> {
     const method = msg.method!;
     const callId = getCallId(msg);
+    const cseq = getHeader(msg, 'cseq') ?? '';
+
+    // Detect and absorb client retransmissions (same Call-ID + CSeq)
+    const clientTxKey = `${callId}:${cseq}`;
+    if (this.activeClientTransactions.has(clientTxKey)) {
+      this.log(`Absorbing retransmission: ${method} (Call-ID: ${callId})`);
+      return;
+    }
+    this.activeClientTransactions.add(clientTxKey);
 
     // Determine target server from the Request-URI
     const target = this.resolveTargetServer(msg);
@@ -472,6 +483,26 @@ export class SipProxy {
     this.log(`Registration stored: ${reg.aor} -> ${reg.clientAddr}:${reg.clientPort} (expires in ${pending.expires}s)`);
   }
 
+  /**
+   * Restore the original Contact URI in a REGISTER 200 OK response.
+   * The proxy rewrote the Contact to point to itself; we need to revert it
+   * so the client recognises its own binding in the response.
+   */
+  private restoreRegisterContact(msg: SipMessage, originalContactUri: string): void {
+    const contacts = msg.headers['contact'];
+    if (!contacts || contacts.length === 0) return;
+
+    const proxyHost = `${this.config.externalIp}:${this.config.sipPort}`;
+
+    msg.headers['contact'] = contacts.map(contact => {
+      if (!contact.includes(proxyHost)) return contact;
+      // Replace only the URI inside <...>, preserving server-added params (;expires=3600 etc.)
+      return contact.replace(CONTACT_URI_RE, `<${originalContactUri}>`);
+    });
+
+    this.log(`REGISTER 200 OK Contact restored to original client URI`);
+  }
+
   // ======================================================================
   // INVITE handling (outgoing - client to server)
   // ======================================================================
@@ -639,8 +670,12 @@ export class SipProxy {
       if (handled) return;
     }
 
-    // REGISTER 200 OK: complete the registration
+    // REGISTER 200 OK: restore original Contact and complete registration
     if (cseqMethod === 'REGISTER' && statusCode >= 200 && statusCode < 300) {
+      const pendingReg = this.pendingRegisters.get(branch);
+      if (pendingReg?.originalContact) {
+        this.restoreRegisterContact(msg, pendingReg.originalContact);
+      }
       this.completeRegistration(branch);
     }
 
@@ -666,6 +701,10 @@ export class SipProxy {
 
     // Clean up transaction on final response
     if (statusCode >= 200) {
+      // Clean up client retransmission tracking (CSeq was already restored above)
+      const restoredCSeq = getHeader(msg, 'cseq') ?? '';
+      this.activeClientTransactions.delete(`${callId}:${restoredCSeq}`);
+
       this.transactions.delete(branch);
       this.pendingRequests.delete(branch);
       this.pendingRegisters.delete(branch);
