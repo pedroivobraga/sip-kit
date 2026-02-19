@@ -76,7 +76,7 @@ export class SipProxy {
   private mediaRelay: MediaRelay;
   private dialogs = new Map<string, SipDialog>();
   // Map branch -> transaction info for routing responses
-  private transactions = new Map<string, { addr: string; port: number; callId: string }>();
+  private transactions = new Map<string, { addr: string; port: number; callId: string; originalCSeq?: string }>();
   // Map branch -> original request + target (for auth retry on 401/407)
   private pendingRequests = new Map<string, { msg: SipMessage; target: SipServer; authAttempted: boolean }>();
   // Map branch -> info needed to complete REGISTER processing on 200 OK
@@ -658,6 +658,12 @@ export class SipProxy {
       }
     }
 
+    // Restore the original CSeq if this response came from an auth-retried request
+    // (the proxy incremented CSeq for the server, but the client expects the original)
+    if (txn.originalCSeq) {
+      setHeader(msg, 'cseq', txn.originalCSeq);
+    }
+
     // Clean up transaction on final response
     if (statusCode >= 200) {
       this.transactions.delete(branch);
@@ -794,8 +800,8 @@ export class SipProxy {
       retryMsg.headers['via'] = [viaValue, ...existingVias];
     }
 
-    const cseq = getHeader(retryMsg, 'cseq') ?? '';
-    const cseqParts = cseq.trim().split(/\s+/);
+    const originalCSeq = getHeader(retryMsg, 'cseq') ?? '';
+    const cseqParts = originalCSeq.trim().split(/\s+/);
     if (cseqParts.length >= 2) {
       const newSeq = parseInt(cseqParts[0], 10) + 1;
       setHeader(retryMsg, 'cseq', `${newSeq} ${cseqParts[1]}`);
@@ -803,7 +809,8 @@ export class SipProxy {
 
     const txn = this.transactions.get(originalBranch);
     if (txn) {
-      this.transactions.set(newBranch, txn);
+      // Save the original CSeq so we can restore it in the response to the client
+      this.transactions.set(newBranch, { ...txn, originalCSeq });
       this.transactions.delete(originalBranch);
     }
 
