@@ -1,19 +1,45 @@
 /**
  * SIP Proxy with synthetic ICE activation.
  *
- * Flow:
- * 1. Client sends SIP messages to the proxy
- * 2. For INVITE: proxy modifies SDP to inject ICE, allocates media relay
- * 3. For other messages: proxy forwards transparently
- * 4. Responses from server are modified (ICE injected in SDP) and forwarded to client
- * 5. Media is relayed through the allocated relay ports
+ * Routing logic:
  *
- * The proxy maintains a mapping of dialogs to route responses correctly.
+ *  ┌──────────┐                    ┌──────────┐
+ *  │  Client  │ ───REGISTER/───►   │          │ ──── forward ────►  ┌──────────┐
+ *  │          │    INVITE/etc      │  Proxy   │                     │  Server  │
+ *  │          │ ◄── responses ──── │          │ ◄── responses ───── │          │
+ *  └──────────┘                    │          │                     └──────────┘
+ *                                  │          │
+ *  ┌──────────┐                    │          │
+ *  │  Client  │ ◄─ incoming ────── │          │ ◄── INVITE ──────── ┌──────────┐
+ *  │          │    INVITE          │          │     (incoming call)  │  Server  │
+ *  │          │ ── 200 OK ───────► │          │ ──── 200 OK ──────► │          │
+ *  └──────────┘                    └──────────┘                     └──────────┘
+ *
+ * How the proxy knows where to route:
+ *
+ * 1. OUTGOING (client → server):
+ *    - Client sends request to proxy
+ *    - Proxy resolves target server from Request-URI (matched against config.servers)
+ *    - Proxy stores Via branch → client addr:port (transaction map)
+ *    - Responses follow the Via chain back to the client
+ *
+ * 2. REGISTER (builds the routing table):
+ *    - Client sends REGISTER sip:server.com through proxy
+ *    - Proxy rewrites Contact header: client's addr → proxy's addr
+ *    - Server now thinks the client lives at the proxy
+ *    - On 200 OK, proxy stores: AOR "user@server" → client addr:port
+ *
+ * 3. INCOMING (server → client):
+ *    - Server sends INVITE to proxy (because Contact pointed here)
+ *    - Proxy detects the source is a known server (isFromServer)
+ *    - Proxy extracts the target user from the Request-URI
+ *    - Looks up user in registration table → finds client addr:port
+ *    - Forwards INVITE to client (with ICE injection on the response)
  */
 
 import * as dgram from 'dgram';
 import * as crypto from 'crypto';
-import { ProxyConfig, SipServer, SipDialog } from './types';
+import { ProxyConfig, SipServer, SipDialog, Registration } from './types';
 import {
   parseSipMessage,
   serializeSipMessage,
@@ -41,6 +67,9 @@ import {
   getAuthHeaderName,
 } from './sip-auth';
 
+// Contact header URI regex: <sip:user@host:port;params> or <sip:host:port>
+const CONTACT_URI_RE = /<(sips?:[^>]+)>/;
+
 export class SipProxy {
   private config: ProxyConfig;
   private socket!: dgram.Socket;
@@ -48,8 +77,21 @@ export class SipProxy {
   private dialogs = new Map<string, SipDialog>();
   // Map branch -> transaction info for routing responses
   private transactions = new Map<string, { addr: string; port: number; callId: string }>();
-  // Map branch -> original request + target server (for auth retry on 401/407)
+  // Map branch -> original request + target (for auth retry on 401/407)
   private pendingRequests = new Map<string, { msg: SipMessage; target: SipServer; authAttempted: boolean }>();
+  // Map branch -> info needed to complete REGISTER processing on 200 OK
+  private pendingRegisters = new Map<string, {
+    aor: string;
+    clientAddr: string;
+    clientPort: number;
+    originalContact: string;
+    serverName: string;
+    serverHost: string;
+    serverPort: number;
+    expires: number;
+  }>();
+  // Registration table: "user@serverHost" -> Registration
+  private registrations = new Map<string, Registration>();
 
   constructor(config: ProxyConfig) {
     this.config = config;
@@ -92,6 +134,7 @@ export class SipProxy {
     for (const [callId, dialog] of this.dialogs) {
       sessions.push({
         callId,
+        direction: dialog.direction,
         fromTag: dialog.fromTag,
         toTag: dialog.toTag,
         client: `${dialog.clientAddr}:${dialog.clientPort}`,
@@ -107,6 +150,21 @@ export class SipProxy {
       });
     }
     return sessions;
+  }
+
+  getRegistrations(): object[] {
+    this.cleanExpiredRegistrations();
+    const result: object[] = [];
+    for (const [, reg] of this.registrations) {
+      result.push({
+        aor: reg.aor,
+        client: `${reg.clientAddr}:${reg.clientPort}`,
+        server: `${reg.serverHost}:${reg.serverPort}`,
+        originalContact: reg.originalContact,
+        expiresIn: Math.max(0, Math.round((reg.expiresAt - Date.now()) / 1000)),
+      });
+    }
+    return result;
   }
 
   async start(): Promise<void> {
@@ -142,6 +200,10 @@ export class SipProxy {
     console.log('[SipProxy] Stopped');
   }
 
+  // ======================================================================
+  // Message handling - entry point
+  // ======================================================================
+
   private async handleMessage(raw: Buffer, rinfo: dgram.RemoteInfo): Promise<void> {
     let msg: SipMessage;
     try {
@@ -158,14 +220,33 @@ export class SipProxy {
     }
   }
 
+  // ======================================================================
+  // REQUEST handling
+  // ======================================================================
+
   private async handleRequest(msg: SipMessage, rinfo: dgram.RemoteInfo): Promise<void> {
     const method = msg.method!;
     const callId = getCallId(msg);
+    const fromServer = this.isFromServer(rinfo);
 
-    this.log(`<-- ${method} from ${rinfo.address}:${rinfo.port} (Call-ID: ${callId})`);
+    this.log(`<-- ${method} from ${rinfo.address}:${rinfo.port} [${fromServer ? 'SERVER' : 'CLIENT'}] (Call-ID: ${callId})`);
+
+    if (fromServer) {
+      await this.handleIncomingRequest(msg, rinfo);
+    } else {
+      await this.handleOutgoingRequest(msg, rinfo);
+    }
+  }
+
+  /**
+   * Handle a request FROM the CLIENT going TO a server (outgoing direction).
+   */
+  private async handleOutgoingRequest(msg: SipMessage, rinfo: dgram.RemoteInfo): Promise<void> {
+    const method = msg.method!;
+    const callId = getCallId(msg);
 
     // Determine target server from the Request-URI
-    const target = this.resolveTarget(msg);
+    const target = this.resolveTargetServer(msg);
     if (!target) {
       this.log(`No matching server for request URI: ${msg.requestUri}`);
       this.sendResponse(msg, 404, 'Not Found', rinfo);
@@ -194,11 +275,16 @@ export class SipProxy {
     });
 
     // Store a deep copy of the original request for auth retry
-    // (before SDP modifications, so we keep the copy pre-Via insertion too)
     const originalCopy = this.cloneMessage(msg);
     this.pendingRequests.set(branch, { msg: originalCopy, target, authAttempted: false });
 
-    // Track dialog
+    // --- Method-specific handling ---
+
+    if (method === 'REGISTER') {
+      await this.handleOutgoingRegister(msg, rinfo, target, branch);
+      return;
+    }
+
     if (method === 'INVITE') {
       const dialog: SipDialog = {
         callId,
@@ -208,19 +294,16 @@ export class SipProxy {
         clientPort: rinfo.port,
         serverAddr: target.host,
         serverPort: target.port,
+        direction: 'outgoing',
       };
       this.dialogs.set(callId, dialog);
-
-      await this.handleInviteRequest(msg, rinfo, target, dialog);
+      await this.handleOutgoingInvite(msg, rinfo, target, dialog);
       return;
     }
 
-    if (method === 'BYE' || method === 'CANCEL') {
-      // Release media relay on BYE
-      if (method === 'BYE') {
-        this.mediaRelay.release(callId);
-        this.dialogs.delete(callId);
-      }
+    if (method === 'BYE') {
+      this.mediaRelay.release(callId);
+      this.dialogs.delete(callId);
     }
 
     // Forward as-is for all other methods
@@ -228,10 +311,172 @@ export class SipProxy {
   }
 
   /**
-   * Handle INVITE request: strip ICE from client SDP, rewrite media endpoint
-   * to point at our server-facing relay, then forward to server.
+   * Handle a request FROM a SERVER coming TO a client (incoming direction).
+   * This happens for incoming calls (INVITE), in-dialog requests (BYE), etc.
    */
-  private async handleInviteRequest(
+  private async handleIncomingRequest(msg: SipMessage, rinfo: dgram.RemoteInfo): Promise<void> {
+    const method = msg.method!;
+    const callId = getCallId(msg);
+
+    // Find which client this request is for
+    const clientEndpoint = this.resolveTargetClient(msg);
+    if (!clientEndpoint) {
+      this.log(`No registered client for incoming ${method}: ${msg.requestUri}`);
+      this.sendResponse(msg, 404, 'Not Found', rinfo);
+      return;
+    }
+
+    this.log(`Routing incoming ${method} to client ${clientEndpoint.addr}:${clientEndpoint.port}`);
+
+    // Decrement Max-Forwards
+    const maxFwd = parseInt(getHeader(msg, 'max-forwards') ?? '70', 10);
+    if (maxFwd <= 0) {
+      this.sendResponse(msg, 483, 'Too Many Hops', rinfo);
+      return;
+    }
+    setHeader(msg, 'max-forwards', String(maxFwd - 1));
+
+    // Add our Via so we get the response back
+    const branch = this.generateBranch();
+    const viaValue = `SIP/2.0/UDP ${this.config.externalIp}:${this.config.sipPort};branch=${branch};rport`;
+    const existingVias = msg.headers['via'] ?? [];
+    msg.headers['via'] = [viaValue, ...existingVias];
+
+    // Store transaction - responses from the CLIENT should go back to the SERVER
+    this.transactions.set(branch, {
+      addr: rinfo.address,
+      port: rinfo.port,
+      callId,
+    });
+
+    if (method === 'INVITE') {
+      const dialog: SipDialog = {
+        callId,
+        fromTag: getFromTag(msg),
+        toTag: '',
+        clientAddr: clientEndpoint.addr,
+        clientPort: clientEndpoint.port,
+        serverAddr: rinfo.address,
+        serverPort: rinfo.port,
+        direction: 'incoming',
+      };
+      this.dialogs.set(callId, dialog);
+
+      // For incoming INVITE, inject ICE into the server's SDP offer
+      await this.handleIncomingInvite(msg, rinfo, clientEndpoint, dialog);
+      return;
+    }
+
+    if (method === 'BYE') {
+      this.mediaRelay.release(callId);
+      this.dialogs.delete(callId);
+    }
+
+    // Forward to the client
+    this.forwardToClient(msg, clientEndpoint.addr, clientEndpoint.port);
+  }
+
+  // ======================================================================
+  // REGISTER handling
+  // ======================================================================
+
+  /**
+   * Handle outgoing REGISTER from client to server.
+   * Rewrites the Contact header to point to the proxy, so the server
+   * will route incoming calls through us.
+   */
+  private async handleOutgoingRegister(
+    msg: SipMessage,
+    rinfo: dgram.RemoteInfo,
+    target: SipServer,
+    branch: string,
+  ): Promise<void> {
+    const contactHeader = getHeader(msg, 'contact');
+
+    // Extract the original Contact URI
+    let originalContact = '';
+    if (contactHeader) {
+      const match = contactHeader.match(CONTACT_URI_RE);
+      originalContact = match ? match[1] : contactHeader;
+    }
+
+    // Extract the AOR from the To header (this is what the client is registering as)
+    const toHeader = getHeader(msg, 'to') ?? '';
+    const toMatch = toHeader.match(/<(sips?:[^>]+)>/) ?? toHeader.match(/(sips?:\S+)/);
+    const aorUri = toMatch ? toMatch[1] : '';
+
+    let aor = '';
+    if (aorUri) {
+      const parsed = parseSipUri(aorUri);
+      aor = parsed.user ? `${parsed.user}@${target.host}` : target.host;
+    }
+
+    // Get expiration
+    const expiresHeader = getHeader(msg, 'expires');
+    let expires = expiresHeader ? parseInt(expiresHeader, 10) : 3600;
+    if (contactHeader?.includes('expires=')) {
+      const expMatch = contactHeader.match(/expires=(\d+)/);
+      if (expMatch) expires = parseInt(expMatch[1], 10);
+    }
+
+    // Rewrite Contact to point to the proxy
+    if (contactHeader && expires > 0) {
+      const parsed = parseSipUri(originalContact || aorUri);
+      const userPart = parsed.user ? `${parsed.user}@` : '';
+      const proxyContact = `<sip:${userPart}${this.config.externalIp}:${this.config.sipPort};transport=udp>`;
+      setHeader(msg, 'contact', proxyContact);
+      this.log(`REGISTER Contact rewritten: ${contactHeader} -> ${proxyContact}`);
+    }
+
+    // Store pending register info (completed on 200 OK)
+    this.pendingRegisters.set(branch, {
+      aor,
+      clientAddr: rinfo.address,
+      clientPort: rinfo.port,
+      originalContact,
+      serverName: target.name,
+      serverHost: target.host,
+      serverPort: target.port,
+      expires,
+    });
+
+    this.forwardToServer(msg, target);
+  }
+
+  /**
+   * Complete a REGISTER on successful 200 OK from server.
+   */
+  private completeRegistration(branch: string): void {
+    const pending = this.pendingRegisters.get(branch);
+    if (!pending) return;
+    this.pendingRegisters.delete(branch);
+
+    if (pending.expires === 0) {
+      this.registrations.delete(pending.aor);
+      this.log(`Registration removed: ${pending.aor}`);
+      return;
+    }
+
+    const reg: Registration = {
+      aor: pending.aor,
+      clientAddr: pending.clientAddr,
+      clientPort: pending.clientPort,
+      originalContact: pending.originalContact,
+      serverName: pending.serverName,
+      serverHost: pending.serverHost,
+      serverPort: pending.serverPort,
+      expiresAt: Date.now() + (pending.expires * 1000),
+    };
+
+    this.registrations.set(pending.aor, reg);
+    this.log(`Registration stored: ${reg.aor} -> ${reg.clientAddr}:${reg.clientPort} (expires in ${pending.expires}s)`);
+  }
+
+  // ======================================================================
+  // INVITE handling (outgoing - client to server)
+  // ======================================================================
+
+  private async handleOutgoingInvite(
     msg: SipMessage,
     rinfo: dgram.RemoteInfo,
     target: SipServer,
@@ -241,7 +486,6 @@ export class SipProxy {
     const contentType = getHeader(msg, 'content-type') ?? '';
 
     if (contentType.includes('sdp') && msg.body) {
-      // Extract client's original media endpoint
       const clientMedia = extractMediaEndpoint(msg.body);
       if (!clientMedia) {
         this.log(`[${callId}] No audio media in SDP`);
@@ -251,10 +495,7 @@ export class SipProxy {
 
       this.log(`[${callId}] Client media endpoint: ${clientMedia.ip}:${clientMedia.port}`);
 
-      // Generate ICE credentials for this session
       const ice = generateIceCredentials();
-
-      // Allocate media relay
       const mediaSession = await this.mediaRelay.allocate(
         callId,
         clientMedia.ip,
@@ -264,13 +505,8 @@ export class SipProxy {
         ice.pwd,
       );
 
-      // Store in dialog
       dialog.mediaSession = mediaSession;
 
-      // Update the SDP:
-      // 1. Strip any existing ICE from client SDP
-      // 2. Rewrite media endpoint to point to our server-facing relay port
-      // This way, the server will send media to our relay, and we forward to the client
       let modifiedSdp = stripIceFromSdp(msg.body);
       modifiedSdp = rewriteSdpEndpoint(
         modifiedSdp,
@@ -281,16 +517,9 @@ export class SipProxy {
       msg.body = modifiedSdp;
       this.log(`[${callId}] Rewrote INVITE SDP: media -> ${this.config.externalIp}:${mediaSession.localServerRtpPort}`);
 
-      // The server-side relay now also knows where the client sends media initially
-      // (we set serverAddr/serverPort to the client's original endpoint so the server-facing
-      // sockets relay back to the client through client-facing sockets)
-      // But actually, we'll learn the server's real endpoint from the 200 OK SDP
-      // So for now, leave serverAddr/serverPort as placeholders
       mediaSession.serverAddr = '';
       mediaSession.serverPort = 0;
       mediaSession.serverRtcpPort = 0;
-
-      // Set the client's direct info for the relay
       mediaSession.clientAddr = clientMedia.ip;
       mediaSession.clientPort = clientMedia.port;
       mediaSession.clientRtcpPort = clientMedia.rtcpPort;
@@ -299,6 +528,66 @@ export class SipProxy {
     this.forwardToServer(msg, target);
   }
 
+  // ======================================================================
+  // INVITE handling (incoming - server to client)
+  // ======================================================================
+
+  private async handleIncomingInvite(
+    msg: SipMessage,
+    rinfo: dgram.RemoteInfo,
+    clientEndpoint: { addr: string; port: number },
+    dialog: SipDialog,
+  ): Promise<void> {
+    const callId = getCallId(msg);
+    const contentType = getHeader(msg, 'content-type') ?? '';
+
+    if (contentType.includes('sdp') && msg.body) {
+      const serverMedia = extractMediaEndpoint(msg.body);
+      if (!serverMedia) {
+        this.log(`[${callId}] No audio media in incoming INVITE SDP`);
+        this.forwardToClient(msg, clientEndpoint.addr, clientEndpoint.port);
+        return;
+      }
+
+      this.log(`[${callId}] Server (caller) media endpoint: ${serverMedia.ip}:${serverMedia.port}`);
+
+      const ice = generateIceCredentials();
+      const mediaSession = await this.mediaRelay.allocate(
+        callId,
+        serverMedia.ip,
+        serverMedia.port,
+        serverMedia.rtcpPort,
+        ice.ufrag,
+        ice.pwd,
+      );
+
+      dialog.mediaSession = mediaSession;
+
+      mediaSession.serverAddr = serverMedia.ip;
+      mediaSession.serverPort = serverMedia.port;
+      mediaSession.serverRtcpPort = serverMedia.rtcpPort;
+      mediaSession.clientAddr = '';
+      mediaSession.clientPort = 0;
+      mediaSession.clientRtcpPort = 0;
+
+      const modifiedSdp = injectIceIntoSdp(
+        msg.body,
+        this.config.externalIp,
+        mediaSession.localClientRtpPort,
+        { ufrag: ice.ufrag, pwd: ice.pwd },
+      );
+
+      msg.body = modifiedSdp;
+      this.log(`[${callId}] Injected ICE into incoming INVITE SDP: relay=${this.config.externalIp}:${mediaSession.localClientRtpPort}`);
+    }
+
+    this.forwardToClient(msg, clientEndpoint.addr, clientEndpoint.port);
+  }
+
+  // ======================================================================
+  // RESPONSE handling
+  // ======================================================================
+
   private async handleResponse(msg: SipMessage, rinfo: dgram.RemoteInfo): Promise<void> {
     const statusCode = msg.statusCode!;
     const cseqMethod = getCSeqMethod(msg);
@@ -306,7 +595,7 @@ export class SipProxy {
 
     this.log(`<-- ${statusCode} ${msg.reasonPhrase} (${cseqMethod}) from ${rinfo.address}:${rinfo.port}`);
 
-    // Find and remove our Via header (the topmost one should be ours)
+    // Find and remove our Via header
     const vias = msg.headers['via'] ?? [];
     if (vias.length === 0) {
       this.log('No Via headers in response, dropping');
@@ -322,7 +611,6 @@ export class SipProxy {
 
     const branch = branchMatch[1];
 
-    // Check if this is our Via
     if (!topVia.includes(this.config.externalIp)) {
       this.log('Top Via is not ours, forwarding as-is');
     }
@@ -334,10 +622,13 @@ export class SipProxy {
     const txn = this.transactions.get(branch);
     if (!txn) {
       this.log(`No transaction found for branch ${branch}, using dialog info`);
-      // Try dialog
       const dialog = this.dialogs.get(callId);
       if (dialog) {
-        this.forwardToClient(msg, dialog.clientAddr, dialog.clientPort);
+        if (dialog.direction === 'outgoing') {
+          this.forwardToClient(msg, dialog.clientAddr, dialog.clientPort);
+        } else {
+          this.sendTo(msg, dialog.serverAddr, dialog.serverPort);
+        }
       }
       return;
     }
@@ -345,21 +636,25 @@ export class SipProxy {
     // Handle 401/407 authentication challenges transparently
     if (isAuthChallenge(msg)) {
       const handled = await this.handleAuthChallenge(msg, branch, rinfo);
-      if (handled) {
-        // Auth retry sent; don't forward the 401/407 to the client
-        return;
-      }
-      // If we couldn't handle it (no credentials), forward to client
+      if (handled) return;
     }
 
-    // For INVITE 200 OK: inject ICE into the response SDP
-    if (cseqMethod === 'INVITE' && statusCode >= 200 && statusCode < 300) {
-      await this.handleInviteResponse(msg, callId);
+    // REGISTER 200 OK: complete the registration
+    if (cseqMethod === 'REGISTER' && statusCode >= 200 && statusCode < 300) {
+      this.completeRegistration(branch);
+    }
 
-      // Store the To tag for dialog
+    // INVITE 200 OK: handle SDP based on dialog direction
+    if (cseqMethod === 'INVITE' && statusCode >= 200 && statusCode < 300) {
       const dialog = this.dialogs.get(callId);
       if (dialog) {
         dialog.toTag = getToTag(msg);
+
+        if (dialog.direction === 'outgoing') {
+          await this.handleOutgoingInviteResponse(msg, callId);
+        } else {
+          await this.handleIncomingInviteResponse(msg, callId);
+        }
       }
     }
 
@@ -367,28 +662,27 @@ export class SipProxy {
     if (statusCode >= 200) {
       this.transactions.delete(branch);
       this.pendingRequests.delete(branch);
+      this.pendingRegisters.delete(branch);
     }
 
-    this.forwardToClient(msg, txn.addr, txn.port);
+    this.sendTo(msg, txn.addr, txn.port);
   }
 
   /**
-   * Handle INVITE 200 OK: inject ICE into the SDP so the client
-   * will perform ICE negotiation with our relay.
+   * Handle 200 OK for an outgoing INVITE (from server, going to client).
+   * Inject ICE into the server's SDP.
    */
-  private async handleInviteResponse(msg: SipMessage, callId: string): Promise<void> {
+  private async handleOutgoingInviteResponse(msg: SipMessage, callId: string): Promise<void> {
     const contentType = getHeader(msg, 'content-type') ?? '';
     if (!contentType.includes('sdp') || !msg.body) return;
 
     const dialog = this.dialogs.get(callId);
     const mediaSession = dialog?.mediaSession;
-
     if (!mediaSession) {
-      this.log(`[${callId}] No media session for INVITE response, passing through`);
+      this.log(`[${callId}] No media session for outgoing INVITE response`);
       return;
     }
 
-    // Extract the server's actual media endpoint
     const serverMedia = extractMediaEndpoint(msg.body);
     if (serverMedia) {
       mediaSession.serverAddr = serverMedia.ip;
@@ -397,8 +691,6 @@ export class SipProxy {
       this.log(`[${callId}] Server media endpoint: ${serverMedia.ip}:${serverMedia.port}`);
     }
 
-    // Inject ICE into the SDP for the client
-    // The client-facing relay port will be the ICE candidate
     const modifiedSdp = injectIceIntoSdp(
       msg.body,
       this.config.externalIp,
@@ -407,23 +699,51 @@ export class SipProxy {
     );
 
     msg.body = modifiedSdp;
-    this.log(`[${callId}] Injected ICE into 200 OK SDP: relay=${this.config.externalIp}:${mediaSession.localClientRtpPort}, ufrag=${mediaSession.iceUfrag}`);
+    this.log(`[${callId}] Injected ICE into 200 OK SDP: relay=${this.config.externalIp}:${mediaSession.localClientRtpPort}`);
   }
 
   /**
-   * Handle a 401/407 authentication challenge from the server.
-   *
-   * The proxy intercepts the challenge, computes the digest response using
-   * the server credentials (password or pre-computed HA1), and resends the
-   * original request with the Authorization header. The client never sees
-   * the 401/407.
-   *
-   * @returns true if auth retry was sent, false if no credentials available
+   * Handle 200 OK for an incoming INVITE (from client, going to server).
+   * Strip ICE from client's SDP and rewrite media to relay.
    */
+  private async handleIncomingInviteResponse(msg: SipMessage, callId: string): Promise<void> {
+    const contentType = getHeader(msg, 'content-type') ?? '';
+    if (!contentType.includes('sdp') || !msg.body) return;
+
+    const dialog = this.dialogs.get(callId);
+    const mediaSession = dialog?.mediaSession;
+    if (!mediaSession) {
+      this.log(`[${callId}] No media session for incoming INVITE response`);
+      return;
+    }
+
+    const clientMedia = extractMediaEndpoint(msg.body);
+    if (clientMedia) {
+      mediaSession.clientAddr = clientMedia.ip;
+      mediaSession.clientPort = clientMedia.port;
+      mediaSession.clientRtcpPort = clientMedia.rtcpPort;
+      this.log(`[${callId}] Client media endpoint: ${clientMedia.ip}:${clientMedia.port}`);
+    }
+
+    let modifiedSdp = stripIceFromSdp(msg.body);
+    modifiedSdp = rewriteSdpEndpoint(
+      modifiedSdp,
+      this.config.externalIp,
+      mediaSession.localServerRtpPort,
+    );
+
+    msg.body = modifiedSdp;
+    this.log(`[${callId}] Rewrote incoming 200 OK SDP: media -> ${this.config.externalIp}:${mediaSession.localServerRtpPort}`);
+  }
+
+  // ======================================================================
+  // Auth challenge handling
+  // ======================================================================
+
   private async handleAuthChallenge(
     response: SipMessage,
     originalBranch: string,
-    rinfo: dgram.RemoteInfo,
+    _rinfo: dgram.RemoteInfo,
   ): Promise<boolean> {
     const pending = this.pendingRequests.get(originalBranch);
     if (!pending) {
@@ -431,7 +751,6 @@ export class SipProxy {
       return false;
     }
 
-    // Prevent infinite auth loops
     if (pending.authAttempted) {
       this.log('Auth already attempted for this request, forwarding 401/407 to client');
       return false;
@@ -439,13 +758,11 @@ export class SipProxy {
 
     const { target } = pending;
 
-    // Check if we have credentials for this server
     if (!target.username || (!target.password && !target.ha1Digest)) {
       this.log(`No credentials for server ${target.name} (${target.host}), forwarding 401/407 to client`);
       return false;
     }
 
-    // Parse the challenge
     const challenge = extractChallenge(response);
     if (!challenge) {
       this.log('Could not parse digest challenge from response');
@@ -454,35 +771,29 @@ export class SipProxy {
 
     this.log(`Auth challenge from ${target.host}: realm="${challenge.realm}", nonce="${challenge.nonce}", qop="${challenge.qop ?? 'none'}"`);
 
-    // Rebuild the original request with a new branch and the auth header
     const retryMsg = this.cloneMessage(pending.msg);
     const method = retryMsg.method!;
     const uri = retryMsg.requestUri!;
 
-    // Compute digest response
     const authValue = computeDigestResponse(challenge, target, method, uri);
     if (!authValue) {
       this.log('Failed to compute digest response');
       return false;
     }
 
-    // Add Authorization or Proxy-Authorization header
     const authHeaderName = getAuthHeaderName(response.statusCode!);
     retryMsg.headers[authHeaderName] = [authValue];
 
-    // Generate a new Via with new branch for the retry
     const newBranch = this.generateBranch();
     const viaValue = `SIP/2.0/UDP ${this.config.externalIp}:${this.config.sipPort};branch=${newBranch};rport`;
     const existingVias = retryMsg.headers['via'] ?? [];
 
-    // Replace the top Via (ours) with the new branch
     if (existingVias.length > 0 && existingVias[0].includes('sipkit')) {
       retryMsg.headers['via'] = [viaValue, ...existingVias.slice(1)];
     } else {
       retryMsg.headers['via'] = [viaValue, ...existingVias];
     }
 
-    // Increment CSeq number
     const cseq = getHeader(retryMsg, 'cseq') ?? '';
     const cseqParts = cseq.trim().split(/\s+/);
     if (cseqParts.length >= 2) {
@@ -490,53 +801,51 @@ export class SipProxy {
       setHeader(retryMsg, 'cseq', `${newSeq} ${cseqParts[1]}`);
     }
 
-    // Map the original client transaction to the new branch
     const txn = this.transactions.get(originalBranch);
     if (txn) {
       this.transactions.set(newBranch, txn);
       this.transactions.delete(originalBranch);
     }
 
-    // Store the retry as pending (with authAttempted = true to prevent loops)
+    // Migrate pendingRegister if this was a REGISTER
+    const pendingReg = this.pendingRegisters.get(originalBranch);
+    if (pendingReg) {
+      this.pendingRegisters.set(newBranch, pendingReg);
+      this.pendingRegisters.delete(originalBranch);
+    }
+
     this.pendingRequests.delete(originalBranch);
     this.pendingRequests.set(newBranch, { msg: retryMsg, target, authAttempted: true });
 
     this.log(`Retrying ${method} to ${target.host}:${target.port} with ${authHeaderName} (ha1=${target.ha1Digest ? 'pre-computed' : 'from-password'})`);
 
-    // Send the authenticated request
     this.forwardToServer(retryMsg, target);
     return true;
   }
 
-  private cloneMessage(msg: SipMessage): SipMessage {
-    return {
-      isRequest: msg.isRequest,
-      method: msg.method,
-      requestUri: msg.requestUri,
-      statusCode: msg.statusCode,
-      reasonPhrase: msg.reasonPhrase,
-      version: msg.version,
-      headers: Object.fromEntries(
-        Object.entries(msg.headers).map(([k, v]) => [k, [...v]])
-      ),
-      body: msg.body,
-    };
+  // ======================================================================
+  // Routing helpers
+  // ======================================================================
+
+  /**
+   * Check if a message comes from a known configured server.
+   */
+  private isFromServer(rinfo: dgram.RemoteInfo): boolean {
+    return this.config.servers.some(s => s.host === rinfo.address);
   }
 
   /**
-   * Resolve a SIP request to a target server based on the Request-URI.
+   * Resolve a target server for an outgoing request (from client).
    */
-  private resolveTarget(msg: SipMessage): SipServer | undefined {
+  private resolveTargetServer(msg: SipMessage): SipServer | undefined {
     const uri = msg.requestUri ?? '';
     try {
       const parsed = parseSipUri(uri);
-      // Find a matching server
       const server = this.config.servers.find(
         s => s.host === parsed.host || s.host === `${parsed.host}:${parsed.port}`,
       );
       if (server) return server;
 
-      // If no exact match, use the URI host directly as a pass-through target
       return {
         name: parsed.host,
         host: parsed.host,
@@ -548,22 +857,73 @@ export class SipProxy {
     }
   }
 
-  private forwardToServer(msg: SipMessage, target: SipServer): void {
-    const data = Buffer.from(serializeSipMessage(msg), 'utf-8');
-    this.log(`--> ${msg.isRequest ? msg.method : msg.statusCode} to ${target.host}:${target.port} (${data.length} bytes)`);
-    this.socket.send(data, target.port, target.host, (err) => {
-      if (err) {
-        this.log(`Error forwarding to ${target.host}:${target.port}: ${err.message}`);
+  /**
+   * Resolve a target client for an incoming request (from server).
+   *
+   * Lookup chain:
+   * 1. Registration table: "user@serverHost"
+   * 2. Registration table: match by user part only
+   * 3. Existing dialog for the Call-ID
+   */
+  private resolveTargetClient(msg: SipMessage): { addr: string; port: number } | null {
+    this.cleanExpiredRegistrations();
+
+    const uri = msg.requestUri ?? '';
+    const callId = getCallId(msg);
+
+    try {
+      const parsed = parseSipUri(uri);
+      const user = parsed.user ?? '';
+
+      // 1. Exact AOR match: "user@serverHost"
+      for (const server of this.config.servers) {
+        const aor = user ? `${user}@${server.host}` : server.host;
+        const reg = this.registrations.get(aor);
+        if (reg) {
+          return { addr: reg.clientAddr, port: reg.clientPort };
+        }
       }
-    });
+
+      // 2. Match by user part across all registrations
+      if (user) {
+        for (const [, reg] of this.registrations) {
+          if (reg.aor.startsWith(`${user}@`)) {
+            return { addr: reg.clientAddr, port: reg.clientPort };
+          }
+        }
+      }
+    } catch {
+      // Fall through to dialog lookup
+    }
+
+    // 3. Existing dialog for this Call-ID
+    const dialog = this.dialogs.get(callId);
+    if (dialog) {
+      return { addr: dialog.clientAddr, port: dialog.clientPort };
+    }
+
+    return null;
+  }
+
+  // ======================================================================
+  // Transport helpers
+  // ======================================================================
+
+  private forwardToServer(msg: SipMessage, target: SipServer): void {
+    this.sendTo(msg, target.host, target.port);
   }
 
   private forwardToClient(msg: SipMessage, addr: string, port: number): void {
+    this.sendTo(msg, addr, port);
+  }
+
+  private sendTo(msg: SipMessage, addr: string, port: number): void {
     const data = Buffer.from(serializeSipMessage(msg), 'utf-8');
-    this.log(`--> ${msg.isRequest ? msg.method : msg.statusCode} to ${addr}:${port} (${data.length} bytes)`);
+    const label = msg.isRequest ? msg.method : String(msg.statusCode);
+    this.log(`--> ${label} to ${addr}:${port} (${data.length} bytes)`);
     this.socket.send(data, port, addr, (err) => {
       if (err) {
-        this.log(`Error forwarding to ${addr}:${port}: ${err.message}`);
+        this.log(`Error sending to ${addr}:${port}: ${err.message}`);
       }
     });
   }
@@ -587,6 +947,35 @@ export class SipProxy {
 
     const data = Buffer.from(serializeSipMessage(resp), 'utf-8');
     this.socket.send(data, rinfo.port, rinfo.address);
+  }
+
+  // ======================================================================
+  // Utility
+  // ======================================================================
+
+  private cloneMessage(msg: SipMessage): SipMessage {
+    return {
+      isRequest: msg.isRequest,
+      method: msg.method,
+      requestUri: msg.requestUri,
+      statusCode: msg.statusCode,
+      reasonPhrase: msg.reasonPhrase,
+      version: msg.version,
+      headers: Object.fromEntries(
+        Object.entries(msg.headers).map(([k, v]) => [k, [...v]])
+      ),
+      body: msg.body,
+    };
+  }
+
+  private cleanExpiredRegistrations(): void {
+    const now = Date.now();
+    for (const [aor, reg] of this.registrations) {
+      if (reg.expiresAt < now) {
+        this.registrations.delete(aor);
+        this.log(`Registration expired: ${aor}`);
+      }
+    }
   }
 
   private generateBranch(): string {

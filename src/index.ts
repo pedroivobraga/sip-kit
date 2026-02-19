@@ -23,6 +23,7 @@ async function main(): Promise<void> {
     addOrUpdateServer: (server) => proxy.addOrUpdateServer(server),
     removeServer: (name) => proxy.removeServer(name),
     getActiveSessions: () => proxy.getActiveSessions(),
+    getRegistrations: () => proxy.getRegistrations(),
   }, apiKey);
 
   await api.start(apiHost, apiPort);

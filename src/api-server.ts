@@ -22,6 +22,7 @@ export interface ApiDependencies {
   addOrUpdateServer: (server: SipServer) => void;
   removeServer: (name: string) => boolean;
   getActiveSessions: () => object[];
+  getRegistrations: () => object[];
 }
 
 export class ManagementApi {
@@ -51,6 +52,7 @@ export class ManagementApi {
         console.log(`  PUT    /api/servers/:name`);
         console.log(`  DELETE /api/servers/:name`);
         console.log(`  GET    /api/sessions`);
+        console.log(`  GET    /api/registrations`);
         resolve();
       });
     });
@@ -112,6 +114,10 @@ export class ManagementApi {
 
     if (path === '/api/sessions' && method === 'GET') {
       return this.handleGetSessions(res);
+    }
+
+    if (path === '/api/registrations' && method === 'GET') {
+      return this.handleGetRegistrations(res);
     }
 
     this.json(res, 404, { error: 'Not found' });
@@ -224,6 +230,7 @@ export class ManagementApi {
       realm: data.realm,
       username: data.username,
       password: data.password,
+      ha1Digest: data.ha1Digest,
     };
 
     this.deps.addOrUpdateServer(server);
@@ -243,6 +250,10 @@ export class ManagementApi {
 
   private handleGetSessions(res: http.ServerResponse): void {
     this.json(res, 200, { sessions: this.deps.getActiveSessions() });
+  }
+
+  private handleGetRegistrations(res: http.ServerResponse): void {
+    this.json(res, 200, { registrations: this.deps.getRegistrations() });
   }
 
   // --- Helpers ---

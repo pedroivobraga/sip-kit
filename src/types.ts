@@ -126,6 +126,37 @@ export interface SipDialog {
   serverAddr: string;
   serverPort: number;
 
+  /** Which side originated the dialog ('client' = outgoing, 'server' = incoming) */
+  direction: 'outgoing' | 'incoming';
+
   /** Associated media session */
   mediaSession?: MediaSession;
+}
+
+/**
+ * Tracks a client registration.
+ *
+ * When a client REGISTERs through the proxy, we store the mapping
+ * so we can route incoming requests from the server back to the client.
+ *
+ * Key = "user@serverHost" (the AOR the client registered on the server)
+ */
+export interface Registration {
+  /** The AOR (Address of Record) on the server, e.g. "1000@pbx.example.com" */
+  aor: string;
+
+  /** The client's real transport address */
+  clientAddr: string;
+  clientPort: number;
+
+  /** The client's original Contact URI */
+  originalContact: string;
+
+  /** Which server this registration is associated with */
+  serverName: string;
+  serverHost: string;
+  serverPort: number;
+
+  /** When this registration expires */
+  expiresAt: number;
 }
