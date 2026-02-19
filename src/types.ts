@@ -41,8 +41,19 @@ export interface SipServer {
   /** SIP digest username */
   username?: string;
 
-  /** SIP digest password */
+  /**
+   * SIP digest password (plain-text).
+   * If provided, HA1 will be computed as MD5(username:realm:password).
+   * Use EITHER password OR ha1Digest, not both.
+   */
   password?: string;
+
+  /**
+   * Pre-computed HA1 digest: MD5(username:realm:password).
+   * Use this when you already have the digest and don't want to store the plain password.
+   * Takes priority over password if both are provided.
+   */
+  ha1Digest?: string;
 }
 
 /** Proxy configuration */

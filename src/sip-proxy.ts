@@ -34,14 +34,22 @@ import {
   generateIceCredentials,
 } from './sdp-ice-injector';
 import { MediaRelay } from './media-relay';
+import {
+  isAuthChallenge,
+  extractChallenge,
+  computeDigestResponse,
+  getAuthHeaderName,
+} from './sip-auth';
 
 export class SipProxy {
   private config: ProxyConfig;
   private socket!: dgram.Socket;
   private mediaRelay: MediaRelay;
   private dialogs = new Map<string, SipDialog>();
-  // Map branch -> { clientAddr, clientPort } for routing responses
+  // Map branch -> transaction info for routing responses
   private transactions = new Map<string, { addr: string; port: number; callId: string }>();
+  // Map branch -> original request + target server (for auth retry on 401/407)
+  private pendingRequests = new Map<string, { msg: SipMessage; target: SipServer; authAttempted: boolean }>();
 
   constructor(config: ProxyConfig) {
     this.config = config;
@@ -184,6 +192,11 @@ export class SipProxy {
       port: rinfo.port,
       callId,
     });
+
+    // Store a deep copy of the original request for auth retry
+    // (before SDP modifications, so we keep the copy pre-Via insertion too)
+    const originalCopy = this.cloneMessage(msg);
+    this.pendingRequests.set(branch, { msg: originalCopy, target, authAttempted: false });
 
     // Track dialog
     if (method === 'INVITE') {
@@ -329,6 +342,16 @@ export class SipProxy {
       return;
     }
 
+    // Handle 401/407 authentication challenges transparently
+    if (isAuthChallenge(msg)) {
+      const handled = await this.handleAuthChallenge(msg, branch, rinfo);
+      if (handled) {
+        // Auth retry sent; don't forward the 401/407 to the client
+        return;
+      }
+      // If we couldn't handle it (no credentials), forward to client
+    }
+
     // For INVITE 200 OK: inject ICE into the response SDP
     if (cseqMethod === 'INVITE' && statusCode >= 200 && statusCode < 300) {
       await this.handleInviteResponse(msg, callId);
@@ -343,6 +366,7 @@ export class SipProxy {
     // Clean up transaction on final response
     if (statusCode >= 200) {
       this.transactions.delete(branch);
+      this.pendingRequests.delete(branch);
     }
 
     this.forwardToClient(msg, txn.addr, txn.port);
@@ -384,6 +408,119 @@ export class SipProxy {
 
     msg.body = modifiedSdp;
     this.log(`[${callId}] Injected ICE into 200 OK SDP: relay=${this.config.externalIp}:${mediaSession.localClientRtpPort}, ufrag=${mediaSession.iceUfrag}`);
+  }
+
+  /**
+   * Handle a 401/407 authentication challenge from the server.
+   *
+   * The proxy intercepts the challenge, computes the digest response using
+   * the server credentials (password or pre-computed HA1), and resends the
+   * original request with the Authorization header. The client never sees
+   * the 401/407.
+   *
+   * @returns true if auth retry was sent, false if no credentials available
+   */
+  private async handleAuthChallenge(
+    response: SipMessage,
+    originalBranch: string,
+    rinfo: dgram.RemoteInfo,
+  ): Promise<boolean> {
+    const pending = this.pendingRequests.get(originalBranch);
+    if (!pending) {
+      this.log('No pending request for auth challenge');
+      return false;
+    }
+
+    // Prevent infinite auth loops
+    if (pending.authAttempted) {
+      this.log('Auth already attempted for this request, forwarding 401/407 to client');
+      return false;
+    }
+
+    const { target } = pending;
+
+    // Check if we have credentials for this server
+    if (!target.username || (!target.password && !target.ha1Digest)) {
+      this.log(`No credentials for server ${target.name} (${target.host}), forwarding 401/407 to client`);
+      return false;
+    }
+
+    // Parse the challenge
+    const challenge = extractChallenge(response);
+    if (!challenge) {
+      this.log('Could not parse digest challenge from response');
+      return false;
+    }
+
+    this.log(`Auth challenge from ${target.host}: realm="${challenge.realm}", nonce="${challenge.nonce}", qop="${challenge.qop ?? 'none'}"`);
+
+    // Rebuild the original request with a new branch and the auth header
+    const retryMsg = this.cloneMessage(pending.msg);
+    const method = retryMsg.method!;
+    const uri = retryMsg.requestUri!;
+
+    // Compute digest response
+    const authValue = computeDigestResponse(challenge, target, method, uri);
+    if (!authValue) {
+      this.log('Failed to compute digest response');
+      return false;
+    }
+
+    // Add Authorization or Proxy-Authorization header
+    const authHeaderName = getAuthHeaderName(response.statusCode!);
+    retryMsg.headers[authHeaderName] = [authValue];
+
+    // Generate a new Via with new branch for the retry
+    const newBranch = this.generateBranch();
+    const viaValue = `SIP/2.0/UDP ${this.config.externalIp}:${this.config.sipPort};branch=${newBranch};rport`;
+    const existingVias = retryMsg.headers['via'] ?? [];
+
+    // Replace the top Via (ours) with the new branch
+    if (existingVias.length > 0 && existingVias[0].includes('sipkit')) {
+      retryMsg.headers['via'] = [viaValue, ...existingVias.slice(1)];
+    } else {
+      retryMsg.headers['via'] = [viaValue, ...existingVias];
+    }
+
+    // Increment CSeq number
+    const cseq = getHeader(retryMsg, 'cseq') ?? '';
+    const cseqParts = cseq.trim().split(/\s+/);
+    if (cseqParts.length >= 2) {
+      const newSeq = parseInt(cseqParts[0], 10) + 1;
+      setHeader(retryMsg, 'cseq', `${newSeq} ${cseqParts[1]}`);
+    }
+
+    // Map the original client transaction to the new branch
+    const txn = this.transactions.get(originalBranch);
+    if (txn) {
+      this.transactions.set(newBranch, txn);
+      this.transactions.delete(originalBranch);
+    }
+
+    // Store the retry as pending (with authAttempted = true to prevent loops)
+    this.pendingRequests.delete(originalBranch);
+    this.pendingRequests.set(newBranch, { msg: retryMsg, target, authAttempted: true });
+
+    this.log(`Retrying ${method} to ${target.host}:${target.port} with ${authHeaderName} (ha1=${target.ha1Digest ? 'pre-computed' : 'from-password'})`);
+
+    // Send the authenticated request
+    this.forwardToServer(retryMsg, target);
+    return true;
+  }
+
+  private cloneMessage(msg: SipMessage): SipMessage {
+    return {
+      isRequest: msg.isRequest,
+      method: msg.method,
+      requestUri: msg.requestUri,
+      statusCode: msg.statusCode,
+      reasonPhrase: msg.reasonPhrase,
+      version: msg.version,
+      headers: Object.fromEntries(
+        Object.entries(msg.headers).map(([k, v]) => [k, [...v]])
+      ),
+      body: msg.body,
+    };
   }
 
   /**

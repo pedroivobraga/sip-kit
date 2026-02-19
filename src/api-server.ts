@@ -136,8 +136,10 @@ export class ManagementApi {
       transport: s.transport,
       realm: s.realm,
       username: s.username,
-      // Password is masked for security
+      // Credentials masked for security
       hasPassword: !!s.password,
+      hasHa1Digest: !!s.ha1Digest,
+      authMode: s.ha1Digest ? 'ha1Digest' : s.password ? 'password' : 'none',
     }));
     this.json(res, 200, { servers });
   }
@@ -177,6 +179,7 @@ export class ManagementApi {
         realm: s.realm,
         username: s.username,
         password: s.password,
+        ha1Digest: s.ha1Digest,
       });
     }
 

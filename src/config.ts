@@ -13,6 +13,7 @@ interface ServerConfigFile {
     realm?: string;
     username?: string;
     password?: string;
+    ha1Digest?: string;
   }>;
 }
 
@@ -35,6 +36,7 @@ export function loadConfig(): ProxyConfig {
       realm: s.realm,
       username: s.username,
       password: s.password,
+      ha1Digest: s.ha1Digest,
     }));
     console.log(`[Config] Loaded ${servers.length} server(s) from ${configPath}`);
   } else {
