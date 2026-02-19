@@ -450,11 +450,21 @@ export class SipProxy {
       if (expMatch) expires = parseInt(expMatch[1], 10);
     }
 
-    // Rewrite Contact to point to the proxy
+    // Rewrite Contact URI to point to the proxy, but preserve Contact params
+    // like +sip.instance, reg-id (RFC 5626 outbound) that Linphone uses to
+    // identify its registration binding. Stripping them causes the client to
+    // think the registration failed and retry with a new Call-ID.
     if (contactHeader && expires > 0) {
       const parsed = parseSipUri(originalContact || aorUri);
       const userPart = parsed.user ? `${parsed.user}@` : '';
-      const proxyContact = `<sip:${userPart}${this.config.externalIp}:${this.config.sipPort};transport=udp>`;
+      const proxyUri = `sip:${userPart}${this.config.externalIp}:${this.config.sipPort};transport=udp`;
+      let proxyContact: string;
+      if (CONTACT_URI_RE.test(contactHeader)) {
+        // Replace only the URI inside <...>, keeping params outside (e.g., +sip.instance, reg-id)
+        proxyContact = contactHeader.replace(CONTACT_URI_RE, `<${proxyUri}>`);
+      } else {
+        proxyContact = `<${proxyUri}>`;
+      }
       setHeader(msg, 'contact', proxyContact);
       this.log(`REGISTER Contact rewritten: ${contactHeader} -> ${proxyContact}`);
     }
@@ -910,6 +920,23 @@ export class SipProxy {
     if (pendingReg) {
       this.pendingRegisters.set(newBranch, pendingReg);
       this.pendingRegisters.delete(originalBranch);
+
+      // The stored clone has the original Contact (client's address).
+      // Rewrite it to the proxy's address so the server registers the proxy
+      // as the contact endpoint (for routing incoming calls through us).
+      const contact = getHeader(retryMsg, 'contact');
+      if (contact) {
+        const uriMatch = contact.match(CONTACT_URI_RE);
+        if (uriMatch) {
+          const origUri = uriMatch[1];
+          const parsed = parseSipUri(origUri);
+          const userPart = parsed.user ? `${parsed.user}@` : '';
+          const proxyUri = `sip:${userPart}${this.config.externalIp}:${this.config.sipPort};transport=udp`;
+          const rewritten = contact.replace(CONTACT_URI_RE, `<${proxyUri}>`);
+          setHeader(retryMsg, 'contact', rewritten);
+          this.log(`Auth retry REGISTER Contact rewritten: ${contact} -> ${rewritten}`);
+        }
+      }
     }
 
     this.pendingRequests.delete(originalBranch);
